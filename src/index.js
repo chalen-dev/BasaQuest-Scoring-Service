@@ -93,7 +93,14 @@ app.post('/score/:attemptId', async (req, res) => {
         const audioBuffer = Buffer.from(await audioBlob.arrayBuffer());
         await fs.writeFile(inputPath, audioBuffer);
         const { durationSeconds } = await transcodeToWav(inputPath, wavPath);
-        const { recognizedWords, segments } = await assessPronunciation(wavPath, attempt.passage_text);
+        // Continuous recognition roughly tracks real-time, but "roughly"
+        // needs real headroom, not a flat cap sized for a short clip --
+        // 3x the take's own length, floored at 30s, is generous enough
+        // that hitting it means Azure's connection actually stalled (see
+        // azureAssess.js's header comment for why that used to hang this
+        // whole request forever instead of ever reaching this timeout).
+        const assessTimeoutMs = Math.max(30_000, durationSeconds * 3000);
+        const { recognizedWords, segments } = await assessPronunciation(wavPath, attempt.passage_text, 'en-US', assessTimeoutMs);
         const referenceWords = attempt.passage_text.split(/\s+/).filter(Boolean);
         const alignedRows = alignWords(referenceWords, recognizedWords);
         const wordRows = alignedRows.map((row) => ({

@@ -73,22 +73,34 @@ export function alignWords(referenceWords, recognizedWords) {
 
     const results = [];
     let refPosition = 0; // 1-based index of the last reference word consumed
+    // How many Insertion rows have landed at the current refPosition so far
+    // (Azure hearing two-plus extra words in a row -- a stutter, a repeated
+    // word, a false start -- before the next real reference word). Every
+    // Insertion used to get a flat `refPosition + 0.5`, so a SECOND
+    // consecutive insertion collided with the first on assessment_attempt_words'
+    // unique (attempt_id, word_index) index and threw the whole scoring
+    // request into a 500 ("duplicate key value violates unique constraint").
+    // Spacing each one out below refPosition + 1 keeps them ordered and
+    // unique without touching real reference word indices.
+    let insertionSeq = 0;
 
     for (const op of ops) {
         if (op.type === 'insert') {
             const rec0 = recognizedWords[op.recIdx];
             results.push(
                 buildRow({
-                    wordIndex: refPosition + 0.5,
+                    wordIndex: refPosition + 0.5 + insertionSeq * 0.01,
                     referenceWord: null,
                     recognizedWord: rec0.word,
                     errorType: 'Insertion',
                     accuracyScore: rec0.accuracyScore,
                 })
             );
+            insertionSeq += 1;
             continue;
         }
 
+        insertionSeq = 0;
         refPosition += 1;
 
         if (op.type === 'delete') {
