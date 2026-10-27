@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { supabaseAuthClient, supabaseAdmin } from './supabaseClients.js';
 import { transcodeToWav } from './transcode.js';
+import { measureVoicedSeconds } from './silence.js';
 import { assessPronunciation, assessSingleWord, weightedAverage } from './azureAssess.js';
 import { alignWords } from './align.js';
 const app = express();
@@ -26,6 +27,9 @@ const RECORDINGS_BUCKET = 'assessment-recordings';
 // against for the game (no rows are ever stored -- see /score-word and
 // /score-sentence).
 const WORD_PASS_THRESHOLD = 80;
+// A passage recording with less voice than this is treated as empty and not
+// sent to Azure (see silence.js).
+const MIN_VOICED_SECONDS = 1.5;
 // Single word/sentence's raw audio, in memory only -- never written to
 // Storage, matching the remediation mic-game's "ephemeral, no
 // persistence" design. 5MB is generous headroom for a few seconds of
@@ -93,6 +97,17 @@ app.post('/score/:attemptId', async (req, res) => {
         const audioBuffer = Buffer.from(await audioBlob.arrayBuffer());
         await fs.writeFile(inputPath, audioBuffer);
         const { durationSeconds } = await transcodeToWav(inputPath, wavPath);
+        // Don't pay Azure to listen to silence: turn away a recording with
+        // (almost) no voice in it before the assessment call.
+        const voicedSeconds = await measureVoicedSeconds(wavPath);
+        if (voicedSeconds < MIN_VOICED_SECONDS) {
+            const message = 'No speech detected in the recording.';
+            await supabaseAdmin
+                .from('assessment_attempts')
+                .update({ status: 'failed', error_message: message })
+                .eq('id', attemptId);
+            return res.status(422).json({ error: message });
+        }
         // Continuous recognition roughly tracks real-time, but "roughly"
         // needs real headroom, not a flat cap sized for a short clip --
         // 3x the take's own length, floored at 30s, is generous enough
