@@ -428,7 +428,10 @@ app.post(
                 return res.status(422).json({ error: 'The recording is too long.', code: 'too_long' });
             }
             const voicedSeconds = await measureVoicedSeconds(wavPath);
-            if (voicedSeconds < MIN_VOICED_SECONDS) {
+            // A short passage takes under 1.5s of voice to read, so the bar scales
+            // down with its word count (about 0.15s a word, never under 0.5s).
+            const minVoiced = Math.min(MIN_VOICED_SECONDS, Math.max(0.5, passageWords.length * 0.15));
+            if (voicedSeconds < minVoiced) {
                 return res.status(422).json({ error: 'No speech detected in the recording.', code: 'silent' });
             }
             if (language === 'fil') {
