@@ -30,6 +30,8 @@ const WORD_PASS_THRESHOLD = 80;
 // A passage recording with less voice than this is treated as empty and not
 // sent to Azure (see silence.js).
 const MIN_VOICED_SECONDS = 1.5;
+// The bar for /score-passage (Reading Coach): just "somebody spoke".
+const MIN_PASSAGE_VOICED_SECONDS = 0.4;
 // Single word/sentence's raw audio, in memory only -- never written to
 // Storage, matching the remediation mic-game's "ephemeral, no
 // persistence" design. 5MB is generous headroom for a few seconds of
@@ -428,10 +430,9 @@ app.post(
                 return res.status(422).json({ error: 'The recording is too long.', code: 'too_long' });
             }
             const voicedSeconds = await measureVoicedSeconds(wavPath);
-            // A short passage takes under 1.5s of voice to read, so the bar scales
-            // down with its word count (about 0.15s a word, never under 0.5s).
-            const minVoiced = Math.min(MIN_VOICED_SECONDS, Math.max(0.5, passageWords.length * 0.15));
-            if (voicedSeconds < minVoiced) {
+            // Only a take with (almost) no voice is turned away: a pupil who reads
+            // part of the passage still gets scored, the rest coming back as omissions.
+            if (voicedSeconds < MIN_PASSAGE_VOICED_SECONDS) {
                 return res.status(422).json({ error: 'No speech detected in the recording.', code: 'silent' });
             }
             if (language === 'fil') {
