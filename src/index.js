@@ -320,6 +320,98 @@ app.post(
         }
     }
 );
+// Whole-passage scoring for Reading Coach Mode. The pupil reads one remediation
+// passage aloud and gets a verdict for every word of it (correct / mispronounced
+// / omitted) while still on the page.
+//
+// Like /score-sentence it is ephemeral: the audio arrives as the raw request
+// body and nothing is stored, no attempt row and no word rows. Unlike it, a
+// passage can run past the 30 seconds one-shot recognition allows, so this uses
+// continuous recognition (assessPronunciation, the same call the full
+// assessment makes), and it turns a take away BEFORE paying Azure for it when it
+// is too long or has no voice in it (the same silence check as /score/:attemptId).
+//
+// words[i] corresponds to the request's words[i] (0-based). Rows for extra
+// words Azure heard (insertions) have no reference word and are dropped, as in
+// /score-sentence.
+const MAX_PASSAGE_AUDIO_BYTES = 15 * 1024 * 1024;
+// Longest take accepted; the app stops recording well before this.
+const MAX_PASSAGE_SECONDS = 150;
+const MAX_PASSAGE_WORDS = 300;
+app.post(
+    '/score-passage',
+    express.raw({ type: () => true, limit: MAX_PASSAGE_AUDIO_BYTES }),
+    async (req, res) => {
+        const authHeader = req.headers.authorization || '';
+        const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+        if (!token) {
+            return res.status(401).json({ error: 'Missing bearer token.' });
+        }
+        const { data: userData, error: userError } = await supabaseAuthClient.auth.getUser(token);
+        if (userError || !userData?.user) {
+            return res.status(401).json({ error: 'Invalid or expired session.' });
+        }
+        const language = typeof req.query.language === 'string' ? req.query.language : 'en';
+        let passageWords = null;
+        try {
+            passageWords = JSON.parse(String(req.query.words || 'null'));
+        } catch {
+            passageWords = null;
+        }
+        if (
+            !Array.isArray(passageWords) ||
+            passageWords.length === 0 ||
+            passageWords.length > MAX_PASSAGE_WORDS ||
+            !passageWords.every((w) => typeof w === 'string')
+        ) {
+            return res.status(400).json({ error: 'Missing or invalid words.' });
+        }
+        if (language !== 'en') {
+            return res.status(400).json({ error: 'Only the English scoring flow is implemented right now.' });
+        }
+        if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+            return res.status(400).json({ error: 'Missing audio body.' });
+        }
+        const workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'basaquest-passage-'));
+        const inputPath = path.join(workDir, 'input');
+        const wavPath = path.join(workDir, 'audio.wav');
+        try {
+            await fs.writeFile(inputPath, req.body);
+            const { durationSeconds } = await transcodeToWav(inputPath, wavPath);
+            if (durationSeconds > MAX_PASSAGE_SECONDS) {
+                return res.status(422).json({ error: 'The recording is too long.', code: 'too_long' });
+            }
+            const voicedSeconds = await measureVoicedSeconds(wavPath);
+            if (voicedSeconds < MIN_VOICED_SECONDS) {
+                return res.status(422).json({ error: 'No speech detected in the recording.', code: 'silent' });
+            }
+            const assessTimeoutMs = Math.max(30_000, durationSeconds * 3000);
+            const { recognizedWords } = await assessPronunciation(
+                wavPath,
+                passageWords.join(' '),
+                'en-US',
+                assessTimeoutMs
+            );
+            const alignedRows = alignWords(passageWords, recognizedWords);
+            const words = alignedRows
+                .filter((row) => row.referenceWord != null)
+                .map((row) => ({
+                    wordIndex: row.wordIndex - 1,
+                    referenceWord: row.referenceWord,
+                    recognizedWord: row.recognizedWord,
+                    errorType: row.errorType,
+                    accuracyScore: row.accuracyScore,
+                    systemVerdict: row.systemVerdict,
+                }));
+            return res.status(200).json({ durationSeconds, voicedSeconds, words });
+        } catch (err) {
+            console.error('[score-passage] failed:', err);
+            return res.status(500).json({ error: 'Scoring failed.', detail: String(err?.message || err) });
+        } finally {
+            await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+        }
+    }
+);
 const port = process.env.PORT || 8787;
 app.listen(port, () => {
     console.log(`BasaQuest scoring service listening on :${port}`);
