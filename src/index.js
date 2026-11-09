@@ -338,6 +338,49 @@ const MAX_PASSAGE_AUDIO_BYTES = 15 * 1024 * 1024;
 // Longest take accepted; the app stops recording well before this.
 const MAX_PASSAGE_SECONDS = 150;
 const MAX_PASSAGE_WORDS = 300;
+// Filipino passages are scored by the separate Filipino model service (the
+// wav2vec2 phoneme scorer in basaquest-filipino-miscue-detection, hosted as a
+// Hugging Face Space), not Azure, which has no Filipino pronunciation
+// assessment. Both must be set for Filipino to work; the key is sent as
+// x-api-key. It runs on CPU and can take as long as the recording is, so the
+// wait is generous.
+const GOP_SERVICE_URL = (process.env.GOP_SERVICE_URL || '').replace(/\/+$/, '');
+const GOP_API_KEY = process.env.GOP_API_KEY || '';
+// Only for a private Space: a Hugging Face read token, sent as the bearer token Spaces ask for.
+const GOP_HF_TOKEN = process.env.GOP_HF_TOKEN || '';
+const GOP_TIMEOUT_MS = 240_000;
+// The Filipino service's verdicts, in this service's vocabulary (what /score-sentence returns).
+const GOP_STATUS_TO_ERROR_TYPE = { correct: 'None', mispronounced: 'Mispronunciation', omitted: 'Omission' };
+async function scoreWithGop(passageWords, wavPath) {
+    const audio = await fs.readFile(wavPath);
+    const url = `${GOP_SERVICE_URL}/score?words=${encodeURIComponent(JSON.stringify(passageWords))}`;
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'x-api-key': GOP_API_KEY,
+            'Content-Type': 'audio/wav',
+            ...(GOP_HF_TOKEN ? { Authorization: `Bearer ${GOP_HF_TOKEN}` } : {}),
+        },
+        body: audio,
+        signal: AbortSignal.timeout(GOP_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+        const detail = await response.text().catch(() => '');
+        throw new Error(`Filipino scorer answered ${response.status}: ${detail.slice(0, 300)}`);
+    }
+    const result = await response.json();
+    return result.words
+        // A token with nothing to pronounce (a lone punctuation mark) has no verdict to show.
+        .filter((w) => !w.unscorable && GOP_STATUS_TO_ERROR_TYPE[w.status] !== undefined)
+        .map((w) => ({
+            wordIndex: w.index,
+            referenceWord: w.word,
+            recognizedWord: null,
+            errorType: GOP_STATUS_TO_ERROR_TYPE[w.status],
+            accuracyScore: null,
+            systemVerdict: w.status === 'correct' ? 'correct' : 'miscue',
+        }));
+}
 app.post(
     '/score-passage',
     express.raw({ type: () => true, limit: MAX_PASSAGE_AUDIO_BYTES }),
@@ -366,8 +409,11 @@ app.post(
         ) {
             return res.status(400).json({ error: 'Missing or invalid words.' });
         }
-        if (language !== 'en') {
-            return res.status(400).json({ error: 'Only the English scoring flow is implemented right now.' });
+        if (language !== 'en' && language !== 'fil') {
+            return res.status(400).json({ error: 'Unsupported language.' });
+        }
+        if (language === 'fil' && (!GOP_SERVICE_URL || !GOP_API_KEY)) {
+            return res.status(400).json({ error: 'Filipino scoring is not set up on this server.' });
         }
         if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
             return res.status(400).json({ error: 'Missing audio body.' });
@@ -384,6 +430,10 @@ app.post(
             const voicedSeconds = await measureVoicedSeconds(wavPath);
             if (voicedSeconds < MIN_VOICED_SECONDS) {
                 return res.status(422).json({ error: 'No speech detected in the recording.', code: 'silent' });
+            }
+            if (language === 'fil') {
+                const filipinoWords = await scoreWithGop(passageWords, wavPath);
+                return res.status(200).json({ durationSeconds, voicedSeconds, words: filipinoWords });
             }
             const assessTimeoutMs = Math.max(30_000, durationSeconds * 3000);
             const { recognizedWords } = await assessPronunciation(
