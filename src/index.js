@@ -7,6 +7,8 @@ import path from 'node:path';
 import { supabaseAuthClient, supabaseAdmin } from './supabaseClients.js';
 import { transcodeToWav } from './transcode.js';
 import { measureVoicedSeconds } from './silence.js';
+import { trimSilenceWav } from './trimSilence.js';
+import { createRateLimiter } from './rateLimit.js';
 import { assessPronunciation, assessSingleWord, weightedAverage } from './azureAssess.js';
 import { alignWords } from './align.js';
 const app = express();
@@ -32,6 +34,11 @@ const WORD_PASS_THRESHOLD = 80;
 const MIN_VOICED_SECONDS = 1.5;
 // The bar for /score-passage (Reading Coach): just "somebody spoke".
 const MIN_PASSAGE_VOICED_SECONDS = 0.4;
+// A spending guard on /score-passage (Azure bills by the second): per signed-in user.
+const passageLimiter = createRateLimiter({
+    perMinute: Number(process.env.PASSAGE_LIMIT_PER_MINUTE) || 20,
+    perDay: Number(process.env.PASSAGE_LIMIT_PER_DAY) || 400,
+});
 // Single word/sentence's raw audio, in memory only -- never written to
 // Storage, matching the remediation mic-game's "ephemeral, no
 // persistence" design. 5MB is generous headroom for a few seconds of
@@ -396,6 +403,15 @@ app.post(
         if (userError || !userData?.user) {
             return res.status(401).json({ error: 'Invalid or expired session.' });
         }
+        const allowed = passageLimiter.take(userData.user.id);
+        if (!allowed.ok) {
+            res.set('Retry-After', String(allowed.retryAfterSeconds));
+            return res.status(429).json({
+                error: 'Too many readings checked. Please wait a moment and try again.',
+                code: 'rate_limited',
+                retryAfterSeconds: allowed.retryAfterSeconds,
+            });
+        }
         const language = typeof req.query.language === 'string' ? req.query.language : 'en';
         let passageWords = null;
         try {
@@ -438,13 +454,18 @@ app.post(
             if (voicedSeconds < minVoiced) {
                 return res.status(422).json({ error: 'No speech detected in the recording.', code: 'silent' });
             }
+            // Cut the quiet before and after the reading: Azure bills by the second of audio sent.
+            const trimmedPath = path.join(workDir, 'trimmed.wav');
+            const trim = await trimSilenceWav(wavPath, trimmedPath).catch(() => ({ path: wavPath, seconds: durationSeconds, trimmed: false }));
+            const scoredPath = trim.path;
+            const scoredSeconds = trim.trimmed ? trim.seconds : durationSeconds;
             if (language === 'fil') {
-                const filipinoWords = await scoreWithGop(passageWords, wavPath);
+                const filipinoWords = await scoreWithGop(passageWords, scoredPath);
                 return res.status(200).json({ durationSeconds, voicedSeconds, words: filipinoWords });
             }
-            const assessTimeoutMs = Math.max(30_000, durationSeconds * 3000);
+            const assessTimeoutMs = Math.max(30_000, scoredSeconds * 3000);
             const { recognizedWords } = await assessPronunciation(
-                wavPath,
+                scoredPath,
                 passageWords.join(' '),
                 'en-US',
                 assessTimeoutMs
