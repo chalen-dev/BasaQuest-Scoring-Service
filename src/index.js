@@ -80,8 +80,11 @@ app.post('/score/:attemptId', async (req, res) => {
             return res.status(403).json({ error: 'Not authorized to score this attempt.' });
         }
     }
-    if (attempt.language !== 'en') {
-        return res.status(400).json({ error: 'Only the English scoring flow is implemented right now.' });
+    if (attempt.language !== 'en' && attempt.language !== 'fil') {
+        return res.status(400).json({ error: 'Only English and Filipino readings can be scored.' });
+    }
+    if (attempt.language === 'fil' && (!GOP_SERVICE_URL || !GOP_API_KEY)) {
+        return res.status(400).json({ error: 'Filipino scoring is not set up on this server.' });
     }
     if (attempt.status === 'processing') {
         return res.status(409).json({ error: 'This attempt is already being scored.' });
@@ -116,6 +119,50 @@ app.post('/score/:attemptId', async (req, res) => {
                 .update({ status: 'failed', error_message: message })
                 .eq('id', attemptId);
             return res.status(422).json({ error: message });
+        }
+        // Filipino readings go to the Filipino model service instead of Azure (which
+        // has no Filipino pronunciation assessment). It judges each word of the passage
+        // as correct, mispronounced or omitted; it gives no fluency or prosody, so those
+        // scores stay empty, and accuracy and completeness are worked out from the words.
+        if (attempt.language === 'fil') {
+            const filReferenceWords = attempt.passage_text.split(/\s+/).filter(Boolean);
+            const filipinoWords = await scoreWithGop(filReferenceWords, wavPath);
+            const filWordRows = filipinoWords.map((w) => ({
+                attempt_id: attemptId,
+                // 1-based, the same as the English rows (see align.js).
+                word_index: w.wordIndex + 1,
+                reference_word: w.referenceWord,
+                recognized_word: null,
+                error_type: w.errorType,
+                accuracy_score: null,
+                system_verdict: w.systemVerdict,
+                confidence: w.confidence >= 0.75 ? 'high' : 'low',
+            }));
+            await supabaseAdmin.from('assessment_attempt_words').delete().eq('attempt_id', attemptId);
+            if (filWordRows.length > 0) {
+                const { error: filInsertError } = await supabaseAdmin.from('assessment_attempt_words').insert(filWordRows);
+                if (filInsertError) throw new Error(`Failed to store word results: ${filInsertError.message}`);
+            }
+            const filTotal = filWordRows.length;
+            const filCorrect = filWordRows.filter((r) => r.error_type === 'None').length;
+            const filOmitted = filWordRows.filter((r) => r.error_type === 'Omission').length;
+            const filScores = {
+                accuracy_score: filTotal ? Math.round((filCorrect / filTotal) * 100) : null,
+                completeness_score: filTotal ? Math.round(((filTotal - filOmitted) / filTotal) * 100) : null,
+                fluency_score: null,
+                prosody_score: null,
+                pron_score: null,
+            };
+            await supabaseAdmin
+                .from('assessment_attempts')
+                .update({
+                    status: 'scored',
+                    scored_at: new Date().toISOString(),
+                    duration_seconds: durationSeconds,
+                    ...filScores,
+                })
+                .eq('id', attemptId);
+            return res.status(200).json({ status: 'scored', utteranceScores: filScores, wordCount: filTotal });
         }
         // Continuous recognition roughly tracks real-time, but "roughly"
         // needs real headroom, not a flat cap sized for a short clip --
@@ -388,6 +435,8 @@ async function scoreWithGop(passageWords, wavPath) {
             errorType: GOP_STATUS_TO_ERROR_TYPE[w.status],
             accuracyScore: null,
             systemVerdict: w.status === 'correct' ? 'correct' : 'miscue',
+            // 0 to 1: how sure the Filipino model is of its verdict on this word.
+            confidence: typeof w.confidence === 'number' ? w.confidence : 0,
         }));
 }
 app.post(
