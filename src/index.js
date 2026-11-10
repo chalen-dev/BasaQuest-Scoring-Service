@@ -432,7 +432,10 @@ app.post(
             const voicedSeconds = await measureVoicedSeconds(wavPath);
             // Only a take with (almost) no voice is turned away: a pupil who reads
             // part of the passage still gets scored, the rest coming back as omissions.
-            if (voicedSeconds < MIN_PASSAGE_VOICED_SECONDS) {
+            // A single word (word-for-word practice) can be over in a fraction of a second, so the bar
+            // is lower for one word than for a passage.
+            const minVoiced = passageWords.length <= 1 ? 0.15 : MIN_PASSAGE_VOICED_SECONDS;
+            if (voicedSeconds < minVoiced) {
                 return res.status(422).json({ error: 'No speech detected in the recording.', code: 'silent' });
             }
             if (language === 'fil') {
