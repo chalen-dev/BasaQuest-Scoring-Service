@@ -11,6 +11,7 @@ import { trimSilenceWav } from './trimSilence.js';
 import { createRateLimiter } from './rateLimit.js';
 import { assessPronunciation, assessSingleWord, weightedAverage } from './azureAssess.js';
 import { alignWords } from './align.js';
+import { estimateFilipinoScores } from './filipinoScores.js';
 const app = express();
 app.use(express.json());
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
@@ -122,11 +123,11 @@ app.post('/score/:attemptId', async (req, res) => {
         }
         // Filipino readings go to the Filipino model service instead of Azure (which
         // has no Filipino pronunciation assessment). It judges each word of the passage
-        // as correct, mispronounced or omitted; it gives no fluency or prosody, so those
-        // scores stay empty, and accuracy and completeness are worked out from the words.
+        // as correct, mispronounced or omitted; accuracy and completeness are worked out
+        // from those, pronunciation and fluency are estimated, and prosody stays empty.
         if (attempt.language === 'fil') {
             const filReferenceWords = attempt.passage_text.split(/\s+/).filter(Boolean);
-            const filipinoWords = await scoreWithGop(filReferenceWords, wavPath);
+            const { words: filipinoWords, estimates } = await scoreWithGop(filReferenceWords, wavPath);
             const filWordRows = filipinoWords.map((w) => ({
                 attempt_id: attemptId,
                 // 1-based, the same as the English rows (see align.js).
@@ -149,9 +150,11 @@ app.post('/score/:attemptId', async (req, res) => {
             const filScores = {
                 accuracy_score: filTotal ? Math.round((filCorrect / filTotal) * 100) : null,
                 completeness_score: filTotal ? Math.round(((filTotal - filOmitted) / filTotal) * 100) : null,
-                fluency_score: null,
+                // Estimated from the model's per-word fit and timing (see filipinoScores.js).
+                fluency_score: estimates.fluency,
+                // Pitch and rhythm are not something the model measures.
                 prosody_score: null,
-                pron_score: null,
+                pron_score: estimates.pronunciation,
             };
             await supabaseAdmin
                 .from('assessment_attempts')
@@ -425,7 +428,7 @@ async function scoreWithGop(passageWords, wavPath) {
         throw new Error(`Filipino scorer answered ${response.status}: ${detail.slice(0, 300)}`);
     }
     const result = await response.json();
-    return result.words
+    const words = result.words
         // A token with nothing to pronounce (a lone punctuation mark) has no verdict to show.
         .filter((w) => !w.unscorable && GOP_STATUS_TO_ERROR_TYPE[w.status] !== undefined)
         .map((w) => ({
@@ -438,6 +441,8 @@ async function scoreWithGop(passageWords, wavPath) {
             // 0 to 1: how sure the Filipino model is of its verdict on this word.
             confidence: typeof w.confidence === 'number' ? w.confidence : 0,
         }));
+    // Pronunciation and fluency, estimated from how well each word fitted and when it was heard.
+    return { words, estimates: estimateFilipinoScores(result.words) };
 }
 app.post(
     '/score-passage',
@@ -509,7 +514,7 @@ app.post(
             const scoredPath = trim.path;
             const scoredSeconds = trim.trimmed ? trim.seconds : durationSeconds;
             if (language === 'fil') {
-                const filipinoWords = await scoreWithGop(passageWords, scoredPath);
+                const { words: filipinoWords } = await scoreWithGop(passageWords, scoredPath);
                 return res.status(200).json({ durationSeconds, voicedSeconds, words: filipinoWords });
             }
             const assessTimeoutMs = Math.max(30_000, scoredSeconds * 3000);
